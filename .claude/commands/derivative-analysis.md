@@ -1,147 +1,189 @@
 # Derivative Analysis — Nifty & Bank Nifty
 
-Perform a comprehensive macro-economic derivative analysis for **Nifty** and/or **Bank Nifty** using live NSE data via the `pynse` library.
+Perform a comprehensive macro-economic derivative analysis for **Nifty** and/or **Bank Nifty**.
 
-## What this skill does
+Data is fetched with a **three-tier strategy**:
+1. **Disk cache** (`~/.pynse/da_cache/`) — 15 min TTL during market hours, 24 h off-market
+2. **NSE live API** — works when run from India with a real browser session
+3. **yfinance fallback** — for spot price and historical data when NSE is unreachable
 
-When invoked, run the following analysis pipeline and present results clearly:
+## Quick Start (recommended)
 
-### 1. Setup
+```python
+from pynse.derivative_analysis import run_analysis
+
+# Both indices with full cache + fallback handling:
+reports = run_analysis()
+
+# Single index:
+reports = run_analysis(symbol='NIFTY')
+
+# Specific expiry:
+import datetime as dt
+reports = run_analysis(symbol='BANKNIFTY', expiry=dt.date(2025, 5, 29))
+```
+
+`run_analysis()` handles all data fetching, prints each report, and returns the report dicts for further use.
+
+---
+
+## Manual pipeline (step-by-step)
+
 ```python
 from pynse import *
-from pynse.derivative_analysis import (
-    parse_option_chain, pcr, max_pain, oi_buildup,
-    support_resistance_from_oi, iv_skew, trend_summary,
-    futures_premium, fii_dii_summary, derivative_report, print_report
+from pynse.derivative_analysis import derivative_report, print_report
+from pynse.data_fetcher import (
+    get_spot, get_hist, get_option_chain,
+    get_fii_dii, get_futures_quote, cache_status,
 )
 import datetime as dt
 
 nse = Nse()
-```
 
-### 2. Fetch data for both indices
+# Check what's already cached:
+print(cache_status())
 
-For each index in `['NIFTY', 'BANKNIFTY']`:
+# Fetch with automatic cache + fallback:
+spot, src   = get_spot('NIFTY', nse=nse)
+hist, src   = get_hist('NIFTY', nse=nse)
+oc, src     = get_option_chain('NIFTY', nse=nse)
+fii_df, src = get_fii_dii(nse=nse)
+fut, src    = get_futures_quote('NIFTY', nse=nse)
 
-```python
-# Option chain (nearest expiry by default)
-oc = nse.option_chain('NIFTY')          # or 'BANKNIFTY'
-expiry_list = nse.expiry_list
-
-# Spot price from live index
-idx_data = nse.get_indices(IndexSymbol.Nifty50)   # or IndexSymbol.NiftyBank
-spot = float(idx_data['last'].iloc[0])
-
-# Near-month futures quote
-fut = nse.get_quote('NIFTY', segment=Segment.FUT)
-futures_ltp = fut.get('lastPrice', spot)
-expiry_date  = fut.get('expiryDate', expiry_list[0])
-days_to_expiry = (expiry_date - dt.date.today()).days
-
-# 1-year price history for trend
-hist = nse.get_hist('NIFTY 50', from_date=dt.date.today() - dt.timedelta(days=365))
-
-# FII/DII (once, shared)
-fii_dii_df = nse.fii_dii()
-```
-
-### 3. Build and print report
-
-```python
 report = derivative_report(
     symbol='NIFTY',
     oc=oc,
     spot=spot,
     hist=hist,
-    fii_dii_df=fii_dii_df,
-    futures_ltp=futures_ltp,
-    days_to_expiry=days_to_expiry,
+    fii_dii_df=fii_df,
+    futures_ltp=fut.get('lastPrice'),
+    days_to_expiry=(fut.get('expiryDate') - dt.date.today()).days if fut.get('expiryDate') else None,
 )
 print_report(report)
 ```
 
-Repeat for `BANKNIFTY` using `IndexSymbol.NiftyBank` and `get_hist('NIFTY BANK', ...)`.
+---
+
+## Daily Data Refresh
+
+To keep the cache fresh without needing to run the full analysis, schedule:
+
+```bash
+# Run once after market close (15:35 IST) on weekdays:
+python -m pynse.refresh_data
+```
+
+**Cron (Linux/Mac):**
+```
+35 15 * * 1-5  cd /path/to/project && python -m pynse.refresh_data >> ~/.pynse/refresh.log 2>&1
+```
+
+**Windows Task Scheduler:**
+- Action: `python -m pynse.refresh_data`
+- Trigger: Daily, 3:35 PM, repeat Mon–Fri
+
+The refresh script logs each data source (nse / yfinance / stale_cache / error) and exits with code 1 if any fetch fails.
 
 ---
 
 ## Macro-Economic Interpretation Framework
 
-After printing the raw report, synthesise and narrate these macro signals:
+After `print_report()`, synthesise the following signals:
 
 ### A. Market Breadth & Positioning
-- **PCR OI > 1.3** → Put writers dominant → markets expect support, bullish lean  
-- **PCR OI < 0.7** → Call writers dominant → markets capping upside, bearish lean  
-- **Max Pain** → Identify gravitational pull; if spot is far above, expect reversion pressure into expiry  
+- **PCR OI > 1.3** → Put writers dominant → bullish lean  
+- **PCR OI < 0.7** → Call writers dominant → upside capped, bearish lean  
+- **Max Pain** → Spot far above max pain = reversion drag into expiry; below = gravitational pull up  
 
-### B. Open Interest & Smart Money Flow
-- **CE OI buildup at resistance** → Confirmed resistance wall; breakout requires heavy short covering  
-- **PE OI buildup at support** → Confirmed support zone; breakdown requires sustained selling  
-- **Change-in-OI signal patterns** (from `oi_buildup()`):
-  - *Long Buildup* at strikes above spot → bullish continuation  
-  - *Short Buildup* at strikes below spot → bearish breakdown expected  
-  - *Short Covering* near support → possible bounce  
-  - *Long Unwinding* near resistance → distribution phase  
+### B. Open Interest Signals
+- **CE OI wall above spot** → Confirmed resistance; breakout needs heavy short covering  
+- **PE OI wall below spot** → Confirmed support; breakdown needs sustained selling  
+- OI buildup patterns (from `oi_buildup()`):
+  - *Long Buildup* above spot → bullish continuation  
+  - *Short Buildup* below spot → breakdown risk  
+  - *Short Covering* near support → bounce candidate  
+  - *Long Unwinding* near resistance → distribution  
 
 ### C. IV Skew & Volatility Regime
-- **Skew > +5** → Fear elevated on downside → hedge or sell put spreads  
-- **Skew < -3** → Complacency or bullish speculation → watch for sharp correction  
-- **ATM IV > 20%** → High volatility regime → prefer selling strategies (strangles/iron condors)  
-- **ATM IV < 12%** → Low volatility → prefer buying strategies (long straddles ahead of events)  
+- **Skew > +5** → Fear on downside → hedge / sell put spreads  
+- **Skew < -3** → Complacency → watch for sharp reversal  
+- **ATM IV > 20%** → High vol regime → prefer premium selling (strangles / iron condors)  
+- **ATM IV < 12%** → Low vol regime → prefer buying ahead of events (straddles)  
 
-### D. Futures Premium (Cost of Carry)
-- **Ann. CoC > 10%** → Speculative long buildup → unsustainable, watch for unwinding  
-- **Ann. CoC 4–8%** → Normal/bullish carry  
-- **Futures at discount** → Heavy hedging or short buildup → bearish  
+### D. Futures Cost of Carry
+- **Ann. CoC > 10%** → Speculative longs; watch for unwinding  
+- **Ann. CoC 4–8%** → Normal bullish carry  
+- **Futures at discount** → Hedge / short buildup → bearish  
 
 ### E. FII / DII Macro Flow
-- **FII net buyers in cash** + **FII net long in index futures** → Strong bullish macro  
-- **FII net sellers** + **DII absorbing** → Range-bound or mild correction  
-- **FII net short in F&O** → Macro hedge or bearish directional bet  
+- **FII net buyers (cash) + net long (F&O)** → Strong bullish macro  
+- **FII net sellers + DII absorbing** → Range-bound / mild correction  
+- **FII net short in F&O** → Macro hedge or directional bear bet  
 
 ### F. Trend Context
-- Spot **above MA20 > MA50** → Primary uptrend; buy dips  
-- Spot **below MA20 < MA50** → Distribution/downtrend; sell rallies  
-- **< 3% from 52W High** → Breakout watch zone  
-- **> 15% from 52W High** → Oversold or bear market zone  
+- Spot **above MA20 > MA50** → Uptrend; buy dips  
+- Spot **below MA20 < MA50** → Downtrend; sell rallies  
+- **< 3% from 52W high** → Breakout watch zone  
+- **> 15% below 52W high** → Oversold / bear market  
 
 ---
 
 ## Output Format
 
-Present results in this order:
+Present in this order:
 
 1. **Raw report** via `print_report()` for Nifty, then Bank Nifty  
 2. **Nifty Macro Narrative** — 4–6 bullet points synthesising all signals  
 3. **Bank Nifty Macro Narrative** — 4–6 bullet points  
-4. **Cross-Index Comparison** — Is Bank Nifty outperforming/underperforming Nifty? What does the spread signal?  
-5. **Trading Opportunities** — List 2–3 specific option strategies with strikes, expiry, rationale  
-   - Format: `Strategy | Legs | Entry | Target | Stop | Rationale`  
-6. **Key Risk Events** — mention upcoming events (RBI policy, earnings season, global macro) that could shift the bias  
+4. **Cross-Index Comparison** — BNF/Nifty ratio vs historical avg; PCR divergence  
+5. **Trading Opportunities** — 2–3 strategies:
+   - Format: `Strategy | Legs | Entry | Target/Stop | Rationale`  
+6. **Key Risk Events** — upcoming macro events that could shift bias  
 
 ---
 
-## Arguments
+## Arguments (`$ARGUMENTS`)
 
-If the user passes `$ARGUMENTS`:
-- A specific symbol like `NIFTY` or `BANKNIFTY` → analyse only that index  
-- An expiry date like `2024-05-30` → use that expiry for option chain  
-- A number of strikes like `20` → show top-N strikes in OI table  
+- `NIFTY` or `BANKNIFTY` → analyse only that index  
+- A date like `2025-05-29` → use as option expiry  
+- `status` → show cache status table only (`cache_status()`)  
+- `refresh` → force-refresh all data (`refresh_all()`)  
 
-Example: `/derivative-analysis NIFTY 2024-05-30`
+Examples:
+```
+/derivative-analysis
+/derivative-analysis NIFTY
+/derivative-analysis BANKNIFTY 2025-05-29
+/derivative-analysis status
+/derivative-analysis refresh
+```
 
 ---
 
-## Error Handling
+## Handling `$ARGUMENTS` in code
 
-- If NSE API is unreachable, print a clear message and suggest checking `nse.market_status()`  
-- If option chain is empty, note that the market may be closed or data unavailable  
-- If history is insufficient (< 20 days), skip trend signals and note it  
+```python
+import sys
+args = "$ARGUMENTS".split()
+
+if 'status' in args:
+    from pynse.data_fetcher import cache_status
+    print(cache_status().to_string(index=False))
+elif 'refresh' in args:
+    from pynse.data_fetcher import refresh_all
+    print(refresh_all())
+else:
+    symbol  = next((a for a in args if a.upper() in ('NIFTY', 'BANKNIFTY')), None)
+    expiry  = next((dt.date.fromisoformat(a) for a in args if '-' in a), None)
+    from pynse.derivative_analysis import run_analysis
+    run_analysis(symbol=symbol, expiry=expiry)
+```
 
 ---
 
 ## Notes
 
-- All analysis uses the `pynse.derivative_analysis` module at `pynse/derivative_analysis.py`  
-- Option chain lot sizes: Nifty = 50, Bank Nifty = 15 (verify current lot size before position sizing)  
-- OI is in number of contracts; multiply by lot size for notional exposure  
-- This analysis is for **educational and research purposes** — not financial advice  
+- Option chain has **no public alternative** to NSE — cache is the only offline fallback  
+- Lot sizes: Nifty = 75, Bank Nifty = 30 (verify current lot size before sizing positions)  
+- OI is in contracts; multiply by lot size for notional  
+- All analysis is for **educational / research purposes** — not financial advice  

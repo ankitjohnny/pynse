@@ -428,3 +428,85 @@ def print_report(report: dict):
         for seg in bias_parts[1].split("; "):
             print(f"    • {seg}")
     print(f"{'═' * 65}\n")
+
+
+# ─── High-level convenience wrapper ─────────────────────────────────────────
+
+def run_analysis(symbol: str = None, expiry: dt.date = None, nse=None) -> list[dict]:
+    """
+    Fetch all data (with cache + yfinance fallback) and return report dicts.
+
+    Parameters
+    ----------
+    symbol  : 'NIFTY', 'BANKNIFTY', or None (both)
+    expiry  : specific option expiry date, or None for nearest
+    nse     : an Nse() instance; created automatically if not provided
+
+    Returns list of report dicts (one per symbol).
+    """
+    from pynse.data_fetcher import (
+        get_spot, get_hist, get_option_chain, get_fii_dii, get_futures_quote,
+    )
+
+    if nse is None:
+        try:
+            from pynse.core import Nse
+            nse = Nse()
+        except Exception:
+            nse = None
+
+    symbols = ([symbol.upper()] if symbol else ["NIFTY", "BANKNIFTY"])
+    today = dt.date.today()
+
+    # FII/DII fetched once and shared
+    fii_df, fii_src = get_fii_dii(nse=nse)
+    if fii_src != "unavailable":
+        print(f"  [data] FII/DII source: {fii_src}")
+
+    reports = []
+    for sym in symbols:
+        print(f"\n{'█' * 65}")
+        print(f"  FETCHING DATA FOR: {sym}")
+        print(f"{'█' * 65}")
+
+        try:
+            spot, spot_src = get_spot(sym, nse=nse)
+            print(f"  [data] spot={spot}  source={spot_src}")
+        except RuntimeError as e:
+            print(f"  ERROR: {e}")
+            continue
+
+        try:
+            hist, hist_src = get_hist(sym, from_date=today - dt.timedelta(days=365), nse=nse)
+            print(f"  [data] hist={len(hist)} rows  source={hist_src}")
+        except RuntimeError as e:
+            print(f"  WARNING: {e}  — trend signals will be skipped")
+            hist = pd.DataFrame()
+
+        try:
+            oc, oc_src = get_option_chain(sym, expiry=expiry, nse=nse)
+            print(f"  [data] option_chain={len(oc)} strikes  source={oc_src}")
+        except RuntimeError as e:
+            print(f"  ERROR: {e}")
+            continue
+
+        fut_quote, fut_src = get_futures_quote(sym, nse=nse)
+        futures_ltp = fut_quote.get("lastPrice") if fut_quote else None
+        expiry_date = fut_quote.get("expiryDate") if fut_quote else None
+        days_to_exp = (expiry_date - today).days if isinstance(expiry_date, dt.date) else None
+        if fut_src != "unavailable":
+            print(f"  [data] futures ltp={futures_ltp}  source={fut_src}")
+
+        report = derivative_report(
+            symbol=sym,
+            oc=oc,
+            spot=spot,
+            hist=hist if not hist.empty else pd.DataFrame(),
+            fii_dii_df=fii_df,
+            futures_ltp=futures_ltp,
+            days_to_expiry=days_to_exp,
+        )
+        print_report(report)
+        reports.append(report)
+
+    return reports
