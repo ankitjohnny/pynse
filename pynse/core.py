@@ -1031,3 +1031,234 @@ class Nse:
 
         else:
             print('skipped')
+
+    def get_cpi(self,
+                base_year: str = '2012',
+                level: str = 'Group',
+                series_code: str = 'Current',
+                state: str = 'All India',
+                sector: str = 'General') -> pd.DataFrame:
+        """
+        Fetch Consumer Price Index (CPI) data from esankhyiki (MoSPI).
+
+        Parameters
+        ----------
+        base_year : str
+            Base year for CPI series. One of '2012', '2010', or '2024'.
+        level : str
+            Hierarchy level: 'Group' or 'Item'.
+        series_code : str
+            'Current' for current series, 'Back' for back series.
+        state : str
+            State name, e.g. 'All India', 'Maharashtra', 'Delhi'.
+        sector : str
+            Sector filter, e.g. 'General', 'Rural', 'Urban'.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns: date, value, state, sector, base_year
+
+        Examples
+        --------
+        >>> nse = Nse()
+        >>> df = nse.get_cpi()
+        >>> df.head()
+        """
+        import ssl
+        import urllib3
+        from requests.adapters import HTTPAdapter
+
+        # Suppress SSL warnings for legacy MoSPI server
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        class _LegacySSLAdapter(HTTPAdapter):
+            def init_poolmanager(self, *args, **kwargs):
+                ctx = ssl.create_default_context()
+                ctx.set_ciphers('DEFAULT')
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                try:
+                    ctx.options |= 0x4  # OP_LEGACY_SERVER_CONNECT
+                except AttributeError:
+                    pass
+                kwargs['ssl_context'] = ctx
+                super().init_poolmanager(*args, **kwargs)
+
+        BASE_URL = 'https://api.mospi.gov.in'
+
+        if base_year == '2024':
+            endpoint = '/api/cpi/getCPIData'
+        else:
+            endpoint = '/api/cpi/getCPIIndex'
+
+        params = {
+            'base_year': base_year,
+            'level': level,
+            'series_code': series_code,
+            'Format': 'JSON',
+        }
+
+        session = requests.Session()
+        session.mount('https://', _LegacySSLAdapter())
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': 'https://esankhyiki.mospi.gov.in/',
+            'Origin': 'https://esankhyiki.mospi.gov.in',
+        })
+
+        try:
+            resp = session.get(BASE_URL + endpoint, params=params, verify=False, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f'CPI fetch failed: {e}')
+            raise
+
+        records = data.get('data', data) if isinstance(data, dict) else data
+
+        if not records:
+            return pd.DataFrame(columns=['date', 'value', 'state', 'sector', 'base_year'])
+
+        df = pd.json_normalize(records) if isinstance(records[0], dict) else pd.DataFrame(records)
+
+        # Normalise column names to lowercase
+        df.columns = [c.lower().strip() for c in df.columns]
+
+        # Map common column name variants
+        for alias, canonical in [('index_value', 'value'), ('cpi', 'value'),
+                                  ('period', 'date'), ('month_year', 'date'),
+                                  ('monthyear', 'date'), ('year_month', 'date')]:
+            if alias in df.columns and canonical not in df.columns:
+                df.rename(columns={alias: canonical}, inplace=True)
+
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
+            df.sort_values('date', inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
+        # Apply state / sector filters if the columns exist
+        if 'state' in df.columns and state:
+            mask = df['state'].str.lower() == state.lower()
+            df = df[mask].copy()
+        else:
+            df['state'] = state
+
+        if 'sector' in df.columns and sector:
+            mask = df['sector'].str.lower() == sector.lower()
+            df = df[mask].copy()
+        else:
+            df['sector'] = sector
+
+        df['base_year'] = base_year
+        return df
+
+    def plot_cpi(self,
+                 df: pd.DataFrame = None,
+                 title: str = 'India CPI (Consumer Price Index)',
+                 output_file: str = 'cpi_chart.html',
+                 **get_cpi_kwargs) -> str:
+        """
+        Plot CPI data as a TradingView Lightweight Charts line chart.
+
+        Fetches data via get_cpi() if ``df`` is not provided.
+        Opens the chart in the default web browser.
+
+        Parameters
+        ----------
+        df : pd.DataFrame, optional
+            Pre-fetched CPI DataFrame from get_cpi(). Fetched if None.
+        title : str
+            Chart title shown at the top.
+        output_file : str
+            Path to the generated HTML file.
+        **get_cpi_kwargs
+            Keyword arguments forwarded to get_cpi() when df is None.
+
+        Returns
+        -------
+        str
+            Path to the generated HTML file.
+
+        Examples
+        --------
+        >>> nse = Nse()
+        >>> nse.plot_cpi()
+        """
+        import json
+        import webbrowser
+
+        if df is None:
+            df = self.get_cpi(**get_cpi_kwargs)
+
+        if 'date' not in df.columns or 'value' not in df.columns:
+            raise ValueError("DataFrame must have 'date' and 'value' columns")
+
+        plot_df = df[['date', 'value']].dropna()
+        plot_df = plot_df.sort_values('date')
+
+        series_data = [
+            {'time': row['date'].strftime('%Y-%m-%d'), 'value': float(row['value'])}
+            for _, row in plot_df.iterrows()
+            if not pd.isna(row['value'])
+        ]
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{title}</title>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body {{ margin: 0; background: #131722; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
+    #header {{ padding: 16px 20px 4px; color: #d1d4dc; font-size: 18px; font-weight: 600; }}
+    #sub {{ padding: 0 20px 12px; color: #787b86; font-size: 13px; }}
+    #chart {{ width: 100%; height: calc(100vh - 80px); }}
+  </style>
+</head>
+<body>
+  <div id="header">{title}</div>
+  <div id="sub">Source: esankhyiki.mospi.gov.in &nbsp;|&nbsp; Base Year: {get_cpi_kwargs.get('base_year', '2012')}</div>
+  <div id="chart"></div>
+  <script>
+    const chart = LightweightCharts.createChart(document.getElementById('chart'), {{
+      layout: {{ background: {{ color: '#131722' }}, textColor: '#d1d4dc' }},
+      grid: {{ vertLines: {{ color: '#1e222d' }}, horzLines: {{ color: '#1e222d' }} }},
+      crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
+      rightPriceScale: {{ borderColor: '#2a2e39' }},
+      timeScale: {{ borderColor: '#2a2e39', timeVisible: true }},
+      width: document.getElementById('chart').clientWidth,
+      height: document.getElementById('chart').clientHeight,
+    }});
+
+    const series = chart.addLineSeries({{
+      color: '#2962ff',
+      lineWidth: 2,
+      crosshairMarkerVisible: true,
+      crosshairMarkerRadius: 4,
+      priceLineVisible: false,
+      lastValueVisible: true,
+    }});
+
+    const data = {json.dumps(series_data)};
+    series.setData(data);
+    chart.timeScale().fitContent();
+
+    window.addEventListener('resize', () => {{
+      chart.applyOptions({{
+        width: document.getElementById('chart').clientWidth,
+        height: document.getElementById('chart').clientHeight,
+      }});
+    }});
+  </script>
+</body>
+</html>"""
+
+        with open(output_file, 'w') as f:
+            f.write(html)
+
+        webbrowser.open(f'file://{os.path.abspath(output_file)}')
+        logger.info(f'CPI chart saved to {output_file}')
+        return output_file
