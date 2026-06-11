@@ -1,0 +1,14 @@
+# Project Anti-Gravity — additional dependencies
+# Install with: pip install -r requirements_anti_gravity.txt
+
+# YouTube Data API v3 (channel scanning, video metadata, duration)
+google-api-python-client>=2.100.0
+
+# Google OAuth2 transport for API authentication
+google-auth-httplib2>=0.2.0
+
+# OAuth2 flow for Google Drive (token refresh, first-run browser consent)
+google-auth-oauthlib>=1.1.0
+
+# Transcript extraction from YouTube videos (no auth required)
+youtube-transcript-api>=0.6.2
