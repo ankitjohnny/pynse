@@ -1,32 +1,33 @@
 """
-StockEdge web scraper — extracts company financial and portfolio data.
+StockEdge web scraper — no API key required.
 
-StockEdge (stockedge.com / web.stockedge.com) uses a REST API at
-api.stockedge.com.  This module authenticates with your StockEdge account
-using e-mail + password (or mobile MPIN / OTP), then exposes methods for
-financials, portfolio holdings, and more.
+Logs in to stockedge.com with your e-mail and password, captures the auth
+token the browser receives, then calls the same internal REST endpoints that
+the web app (web.stockedge.com) uses.  All data is returned as
+``pandas.DataFrame``.
 
 Quick start
 -----------
 >>> from pynse.stockedge import StockEdge, Period
 >>> se = StockEdge()
->>> se.login(email="you@example.com", password="yourpassword")
+>>> se.login("you@example.com", "yourpassword")
 >>> results = se.search("Reliance")
->>> security_id = results.iloc[0]["SecurityId"]
->>> se.get_profit_loss(security_id)
->>> se.get_balance_sheet(security_id)
->>> se.get_cash_flow(security_id)
->>> se.get_key_ratios(security_id)
->>> se.get_shareholding(security_id)
->>> se.get_mf_holdings(security_id)
+>>> sid = int(results.iloc[0]["SecurityId"])
+>>> se.get_profit_loss(sid)
+>>> se.get_balance_sheet(sid)
+>>> se.get_shareholding(sid)
+>>> se.get_mf_holdings(sid)
 """
 
+from __future__ import annotations
+
 import enum
+import json
 import logging
 import os
 import pickle
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import requests
@@ -35,55 +36,55 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Base URLs and endpoint map
+# URL constants
 # ---------------------------------------------------------------------------
 
-_API_BASE = "https://api.stockedge.com/Api"
-_WEB_BASE = "https://web.stockedge.com"
-_SITE_BASE = "https://stockedge.com"
+_SITE   = "https://stockedge.com"
+_API    = "https://api.stockedge.com/Api"
+_WEB    = "https://web.stockedge.com"
 
-_ENDPOINTS: dict[str, str] = {
-    # --- Authentication ---
-    "login_email":          "/UserRegistrationApi/LoginWithEmailAndPassword",
-    "login_mobile":         "/UserRegistrationApi/LoginWithMobileNumberAndMPIN",
-    "send_otp":             "/UserRegistrationApi/GenerateOTPForLogin",
-    "login_otp":            "/UserRegistrationApi/LoginWithMobileNumberAndOTP",
-    "user_profile":         "/UserRegistrationApi/GetUserProfile",
-
-    # --- Search ---
-    "search":               "/DashboardApi/GetSearchedEntityList/{query}/0",
-    "all_securities":       "/SecurityApi/GetAllSecurities/0",
-
-    # --- Company info ---
-    "company_info":         "/DashboardApi/GetCompanyBySecurityId/{sid}",
-
-    # --- Financial statements (period: 0=annual, 1=quarterly) ---
-    "financial_results":    "/SecurityDashboardApi/GetFinancialResultsForSecurity/{sid}/{period}",
-    "balance_sheet":        "/SecurityDashboardApi/GetBalanceSheetForSecurity/{sid}/{period}",
-    "profit_loss":          "/SecurityDashboardApi/GetProfitAndLossForSecurity/{sid}/{period}",
-    "cash_flow":            "/SecurityDashboardApi/GetCashFlowForSecurity/{sid}/{period}",
-    "key_ratios":           "/SecurityDashboardApi/GetKeyRatiosForSecurity/{sid}/{period}",
-
-    # --- Portfolio / holdings ---
-    "shareholding":         "/SecurityDashboardApi/GetShareholdingPatternForSecurity/{sid}/10",
-    "mf_holdings":          "/SecurityDashboardApi/GetMutualFundHoldingForSecurity/{sid}/10",
-    "fii_holdings":         "/SecurityDashboardApi/GetFIIHoldingForSecurity/{sid}/10",
-    "bulk_deals":           "/SecurityDashboardApi/GetBulkAndBlockDealForSecurity/{sid}/10",
-    "insider_trading":      "/SecurityDashboardApi/GetInsiderTradingForSecurity/{sid}/10",
-
-    # --- Misc ---
-    "peer_comparison":      "/SecurityDashboardApi/GetPeerComparisonForSecurity/{sid}",
-    "price_history":        "/SecurityDashboardApi/GetPriceHistoryForSecurity/{sid}/10",
-    "edge_report":          "/SecurityDashboardApi/GetEdgeReportForSecurity/{sid}",
+# Internal endpoints the SPA uses — same calls we'll make after login
+_EP: dict[str, str] = {
+    # --- auth ---
+    "login_email":      "/UserRegistrationApi/LoginWithEmailAndPassword",
+    "login_mobile":     "/UserRegistrationApi/LoginWithMobileNumberAndMPIN",
+    "send_otp":         "/UserRegistrationApi/GenerateOTPForLogin",
+    "login_otp":        "/UserRegistrationApi/LoginWithMobileNumberAndOTP",
+    "user_profile":     "/UserRegistrationApi/GetUserProfile",
+    # --- search ---
+    "search":           "/DashboardApi/GetSearchedEntityList/{q}/0",
+    "all_securities":   "/SecurityApi/GetAllSecurities/0",
+    # --- company ---
+    "company_info":     "/DashboardApi/GetCompanyBySecurityId/{sid}",
+    # --- financials (period 0=annual, 1=quarterly) ---
+    "fin_results":      "/SecurityDashboardApi/GetFinancialResultsForSecurity/{sid}/{p}",
+    "balance_sheet":    "/SecurityDashboardApi/GetBalanceSheetForSecurity/{sid}/{p}",
+    "profit_loss":      "/SecurityDashboardApi/GetProfitAndLossForSecurity/{sid}/{p}",
+    "cash_flow":        "/SecurityDashboardApi/GetCashFlowForSecurity/{sid}/{p}",
+    "key_ratios":       "/SecurityDashboardApi/GetKeyRatiosForSecurity/{sid}/{p}",
+    # --- portfolio ---
+    "shareholding":     "/SecurityDashboardApi/GetShareholdingPatternForSecurity/{sid}/10",
+    "mf_holdings":      "/SecurityDashboardApi/GetMutualFundHoldingForSecurity/{sid}/10",
+    "fii_holdings":     "/SecurityDashboardApi/GetFIIHoldingForSecurity/{sid}/10",
+    "bulk_deals":       "/SecurityDashboardApi/GetBulkAndBlockDealForSecurity/{sid}/10",
+    "insider_trading":  "/SecurityDashboardApi/GetInsiderTradingForSecurity/{sid}/10",
+    # --- misc ---
+    "peer_comparison":  "/SecurityDashboardApi/GetPeerComparisonForSecurity/{sid}",
+    "price_history":    "/SecurityDashboardApi/GetPriceHistoryForSecurity/{sid}/10",
+    "edge_report":      "/SecurityDashboardApi/GetEdgeReportForSecurity/{sid}",
 }
 
-_BROWSER_HEADERS: dict[str, str] = {
+# Headers that match what Chrome sends when visiting web.stockedge.com
+_HEADERS: dict[str, str] = {
     "Accept":           "application/json, text/plain, */*",
-    "Accept-Language":  "en-US,en;q=0.9",
+    "Accept-Language":  "en-US,en;q=0.9,hi;q=0.8",
     "Accept-Encoding":  "gzip, deflate, br",
     "Connection":       "keep-alive",
-    "Origin":           _WEB_BASE,
-    "Referer":          _WEB_BASE + "/",
+    "Origin":           _WEB,
+    "Referer":          _WEB + "/",
+    "Sec-Fetch-Dest":   "empty",
+    "Sec-Fetch-Mode":   "cors",
+    "Sec-Fetch-Site":   "same-site",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -97,8 +98,8 @@ _BROWSER_HEADERS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 class Period(enum.Enum):
-    """Period type for financial statements."""
-    Annual = 0
+    """Statement period."""
+    Annual    = 0
     Quarterly = 1
 
 
@@ -108,327 +109,283 @@ class Period(enum.Enum):
 
 class StockEdge:
     """
-    Client for StockEdge (stockedge.com) financial data.
+    Browser-session scraper for StockEdge.
 
-    Authentication
-    --------------
-    Login once with your StockEdge credentials.  The session token is cached
-    to ``~/.pynse/stockedge/session.pkl`` so you don't need to log in on
-    every run.
+    No API key is required — only the e-mail and password you use to log in
+    at stockedge.com.
 
-    >>> se = StockEdge()
-    >>> se.login(email="you@example.com", password="secret")
-
-    Mobile login (MPIN):
-    >>> se.login(mobile="9876543210", mpin="1234")
-
-    Mobile login (OTP):
-    >>> se.send_otp("9876543210")
-    >>> se.login_with_otp("9876543210", "654321")
-
-    Data methods
-    ------------
-    All data methods return a ``pandas.DataFrame``.
+    The auth token is cached in ``~/.pynse/stockedge/session.pkl`` so you
+    only need to call :meth:`login` once per session.
 
     Parameters
     ----------
     timeout : int
-        HTTP request timeout in seconds (default 20).
+        HTTP timeout in seconds (default 20).
     cache_dir : str, optional
-        Directory used to cache the auth session.
-        Defaults to ``~/.pynse/stockedge/``.
+        Override the default cache directory.
+
+    Examples
+    --------
+    >>> se = StockEdge()
+    >>> se.login("you@example.com", "password")
+    >>> df = se.search("TCS")
+    >>> sid = int(df.iloc[0]["SecurityId"])
+    >>> se.get_profit_loss(sid)
+    >>> se.get_balance_sheet(sid)
+    >>> se.get_shareholding(sid)
     """
 
     def __init__(self, timeout: int = 20, cache_dir: Optional[str] = None):
         self.timeout = timeout
         self._session = requests.Session()
-        self._session.headers.update(_BROWSER_HEADERS)
+        self._session.headers.update(_HEADERS)
 
-        self._token: Optional[str] = None
+        self._token:   Optional[str] = None
         self._user_id: Optional[int] = None
 
-        cache_root = cache_dir or os.path.join(
-            os.path.expanduser("~"), ".pynse", "stockedge"
-        )
-        os.makedirs(cache_root, exist_ok=True)
-        self._cache_dir = cache_root
-        self._token_file = os.path.join(cache_root, "session.pkl")
-
-        self._load_cached_session()
+        _dir = cache_dir or os.path.join(os.path.expanduser("~"), ".pynse", "stockedge")
+        os.makedirs(_dir, exist_ok=True)
+        self._cache_dir  = _dir
+        self._token_file = os.path.join(_dir, "session.pkl")
+        self._load_session()
 
     # ------------------------------------------------------------------
-    # Session persistence
+    # Session cache
     # ------------------------------------------------------------------
 
-    def _load_cached_session(self) -> None:
+    def _load_session(self) -> None:
         if not os.path.exists(self._token_file):
             return
         try:
             with open(self._token_file, "rb") as f:
-                data = pickle.load(f)
-            self._token = data.get("token")
-            self._user_id = data.get("user_id")
+                d = pickle.load(f)
+            self._token   = d.get("token")
+            self._user_id = d.get("user_id")
             if self._token:
                 self._session.headers["Authorization"] = f"Bearer {self._token}"
-                logger.debug("Loaded cached StockEdge session (user_id=%s).", self._user_id)
+                logger.debug("Loaded cached session (user=%s).", self._user_id)
         except Exception as exc:
-            logger.warning("Could not load cached session: %s", exc)
+            logger.warning("Could not restore session: %s", exc)
 
-    def _persist_session(self) -> None:
+    def _save_session(self) -> None:
         with open(self._token_file, "wb") as f:
             pickle.dump({"token": self._token, "user_id": self._user_id}, f)
-        logger.debug("Session saved to %s", self._token_file)
 
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------
 
-    def login(
-        self,
-        *,
-        email: Optional[str] = None,
-        password: Optional[str] = None,
-        mobile: Optional[str] = None,
-        mpin: Optional[str] = None,
-    ) -> dict:
+    def login(self, email: str, password: str) -> dict:
         """
-        Log in to StockEdge.
+        Log in with your StockEdge e-mail and password.
 
-        Supply either ``email`` + ``password`` (web account)
-        or ``mobile`` + ``mpin`` (app account).
+        The token is cached locally so you don't need to log in on every run.
 
         Parameters
         ----------
-        email : str, optional
-            E-mail address registered with StockEdge.
-        password : str, optional
-            Account password.
-        mobile : str, optional
-            10-digit mobile number registered with StockEdge.
-        mpin : str, optional
-            4–6 digit MPIN set in the StockEdge app.
+        email : str
+            E-mail registered at stockedge.com.
+        password : str
+            Your account password.
 
         Returns
         -------
-        dict  Raw API response.
+        dict  Raw response (includes user profile on success).
 
         Examples
         --------
-        >>> se.login(email="you@example.com", password="secret")
-        >>> se.login(mobile="9876543210", mpin="1234")
+        >>> se.login("you@example.com", "secret")
         """
-        if email and password:
-            url = _API_BASE + _ENDPOINTS["login_email"]
-            payload = {
-                "Email": email,
-                "Password": password,
-                "DeviceType": "W",
-            }
-        elif mobile and mpin:
-            url = _API_BASE + _ENDPOINTS["login_mobile"]
-            payload = {
-                "MobileNumber": mobile,
-                "MPIN": mpin,
-                "DeviceType": "W",
-            }
-        else:
-            raise ValueError(
-                "Provide either (email + password) or (mobile + mpin)."
-            )
-        return self._execute_login(url, payload)
+        url     = _API + _EP["login_email"]
+        payload = {"Email": email, "Password": password, "DeviceType": "W"}
+        return self._do_login(url, payload)
 
-    def send_otp(self, mobile: str) -> dict:
+    def login_mobile(self, mobile: str, mpin: str) -> dict:
         """
-        Request an OTP SMS to *mobile*.
+        Log in with your registered mobile number and MPIN.
 
         Parameters
         ----------
         mobile : str
             10-digit mobile number.
+        mpin : str
+            4–6 digit MPIN.
 
         Returns
         -------
-        dict  API response (check IsSuccess field).
+        dict
+
+        Examples
+        --------
+        >>> se.login_mobile("9876543210", "1234")
         """
-        url = _API_BASE + _ENDPOINTS["send_otp"]
+        url     = _API + _EP["login_mobile"]
+        payload = {"MobileNumber": mobile, "MPIN": mpin, "DeviceType": "W"}
+        return self._do_login(url, payload)
+
+    def send_otp(self, mobile: str) -> dict:
+        """
+        Request an OTP SMS.
+
+        Parameters
+        ----------
+        mobile : str
+
+        Returns
+        -------
+        dict
+        """
+        url     = _API + _EP["send_otp"]
         payload = {"MobileNumber": mobile, "DeviceType": "W"}
-        resp = self._session.post(url, json=payload, timeout=self.timeout)
+        resp    = self._session.post(url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
-        logger.info("OTP sent to %s", mobile)
+        logger.info("OTP sent to %s.", mobile)
         return resp.json()
 
-    def login_with_otp(self, mobile: str, otp: str) -> dict:
+    def login_otp(self, mobile: str, otp: str) -> dict:
         """
-        Complete OTP-based login.
+        Complete OTP login.
 
         Parameters
         ----------
         mobile : str
         otp : str
-            One-time password from SMS.
 
         Returns
         -------
-        dict  Raw API response.
+        dict
         """
-        url = _API_BASE + _ENDPOINTS["login_otp"]
+        url     = _API + _EP["login_otp"]
         payload = {"MobileNumber": mobile, "OTP": otp, "DeviceType": "W"}
-        return self._execute_login(url, payload)
+        return self._do_login(url, payload)
 
-    def _execute_login(self, url: str, payload: dict) -> dict:
+    def _do_login(self, url: str, payload: dict) -> dict:
+        """POST credentials and store the returned Bearer token."""
         resp = self._session.post(url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
 
-        # Token may be nested under different keys depending on API version
+        # Token field name varies slightly across API versions
         token = (
             data.get("Token")
             or data.get("token")
             or data.get("AuthToken")
-            or (data.get("Data") or {}).get("Token")
-            or (data.get("Result") or {}).get("Token")
+            or _deep(data, "Data", "Token")
+            or _deep(data, "Result", "Token")
         )
         user_id = (
             data.get("UserId")
             or data.get("userId")
-            or (data.get("Data") or {}).get("UserId")
-            or (data.get("Result") or {}).get("UserId")
+            or _deep(data, "Data", "UserId")
+            or _deep(data, "Result", "UserId")
         )
 
         if token:
-            self._token = token
+            self._token   = token
             self._user_id = user_id
             self._session.headers["Authorization"] = f"Bearer {token}"
-            self._persist_session()
-            logger.info("StockEdge login successful (user_id=%s).", user_id)
+            self._save_session()
+            logger.info("Login successful (user_id=%s).", user_id)
         else:
             logger.warning(
-                "Login response received but no token found. "
-                "Check credentials or inspect the response: %s", data
+                "Login POST succeeded but no token in response. "
+                "Raw response: %s", json.dumps(data, indent=2)
             )
-
         return data
 
-    def get_user_profile(self) -> dict:
-        """Return the authenticated user's profile."""
-        self._require_auth()
-        return self._get(_ENDPOINTS["user_profile"])
-
     def logout(self) -> None:
-        """Clear the cached session."""
-        self._token = None
+        """Clear the cached auth token."""
+        self._token   = None
         self._user_id = None
         self._session.headers.pop("Authorization", None)
         if os.path.exists(self._token_file):
             os.remove(self._token_file)
-        logger.info("Logged out and cleared cached session.")
+        logger.info("Logged out.")
+
+    def get_user_profile(self) -> dict:
+        """Return the profile of the currently authenticated user."""
+        self._require_auth()
+        return self._get(_EP["user_profile"])
 
     # ------------------------------------------------------------------
-    # Internal HTTP helpers
+    # Internal HTTP
     # ------------------------------------------------------------------
 
     def _require_auth(self) -> None:
         if not self._token:
             raise RuntimeError(
-                "Not authenticated. "
-                "Call se.login(email='...', password='...') first."
+                "Not logged in.  Call se.login('email', 'password') first."
             )
 
-    def _get(self, path: str, params: Optional[dict] = None, retries: int = 3):
-        url = _API_BASE + path
-        for attempt in range(retries):
+    def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        url = _API + path
+        for attempt in range(3):
             try:
                 resp = self._session.get(url, params=params, timeout=self.timeout)
                 if resp.status_code == 401:
                     raise PermissionError(
-                        "Session expired or unauthorized. "
-                        "Call se.login(...) to re-authenticate."
+                        "Session expired — call se.login() again."
                     )
                 resp.raise_for_status()
                 return resp.json()
             except (requests.ConnectionError, requests.Timeout) as exc:
-                if attempt < retries - 1:
+                if attempt < 2:
                     delay = 2 ** attempt
-                    logger.warning("Request failed (%s). Retrying in %ds…", exc, delay)
-                    time.sleep(delay)
-                else:
-                    raise
-
-    def _post(self, path: str, payload: dict, retries: int = 3):
-        url = _API_BASE + path
-        for attempt in range(retries):
-            try:
-                resp = self._session.post(url, json=payload, timeout=self.timeout)
-                resp.raise_for_status()
-                return resp.json()
-            except (requests.ConnectionError, requests.Timeout) as exc:
-                if attempt < retries - 1:
-                    delay = 2 ** attempt
-                    logger.warning("Request failed (%s). Retrying in %ds…", exc, delay)
+                    logger.warning("Network error (%s). Retrying in %ds…", exc, delay)
                     time.sleep(delay)
                 else:
                     raise
 
     # ------------------------------------------------------------------
-    # Search and company info
+    # Search / company
     # ------------------------------------------------------------------
 
     def search(self, query: str) -> pd.DataFrame:
         """
-        Search for stocks, ETFs, or indices by name or ticker.
+        Search for a company, ETF, or index by name or symbol.
 
         Parameters
         ----------
         query : str
-            Company name or NSE/BSE symbol  (e.g. ``"Reliance"`` or ``"TCS"``).
+            E.g. ``"Reliance"``, ``"TCS"``, ``"HDFC Bank"``.
 
         Returns
         -------
         pd.DataFrame
-            Columns include ``SecurityId``, ``SecurityName``, ``SecurityCode``,
-            ``ExchangeName``, ``Sector``.  Use ``SecurityId`` as the key for
-            all other methods.
+            Key columns: ``SecurityId``, ``SecurityName``, ``SecurityCode``,
+            ``ExchangeName``.  Pass ``SecurityId`` to all other methods.
 
         Examples
         --------
         >>> df = se.search("Infosys")
-        >>> security_id = df.iloc[0]["SecurityId"]
+        >>> sid = int(df.iloc[0]["SecurityId"])
         """
-        path = _ENDPOINTS["search"].format(query=query)
-        data = self._get(path)
-        return _to_df(data)
+        data = self._get(_EP["search"].format(q=query))
+        return _df(data)
 
     def get_company_info(self, security_id: int) -> dict:
         """
-        Detailed company profile for *security_id*.
+        Company profile — sector, ISIN, market cap, listing date, etc.
 
         Parameters
         ----------
-        security_id : int
-            StockEdge SecurityId (obtain via :meth:`search`).
-
-        Returns
-        -------
-        dict  Company metadata (name, sector, ISIN, market cap, …).
+        security_id : int  (from :meth:`search`)
 
         Examples
         --------
-        >>> se.get_company_info(2969)   # Reliance Industries
+        >>> se.get_company_info(2969)   # 2969 = Reliance Industries
         """
-        path = _ENDPOINTS["company_info"].format(sid=security_id)
-        return self._get(path)
+        return self._get(_EP["company_info"].format(sid=security_id))
 
     # ------------------------------------------------------------------
     # Financial statements
     # ------------------------------------------------------------------
 
     def get_financials(
-        self,
-        security_id: int,
-        period: Period = Period.Annual,
+        self, security_id: int, period: Period = Period.Annual
     ) -> pd.DataFrame:
         """
-        Consolidated financial results (Revenue, PAT, EPS, …).
+        Consolidated financial results — Revenue, PAT, EPS, etc.
 
         Parameters
         ----------
@@ -436,148 +393,111 @@ class StockEdge:
         period : Period
             ``Period.Annual`` (default) or ``Period.Quarterly``.
 
-        Returns
-        -------
-        pd.DataFrame
-
         Examples
         --------
         >>> se.get_financials(2969)
-        >>> se.get_financials(2969, period=Period.Quarterly)
+        >>> se.get_financials(2969, Period.Quarterly)
         """
         self._require_auth()
-        path = _ENDPOINTS["financial_results"].format(
-            sid=security_id, period=period.value
-        )
-        return _to_df(self._get(path))
+        return _df(self._get(
+            _EP["fin_results"].format(sid=security_id, p=period.value)
+        ))
 
     def get_profit_loss(
-        self,
-        security_id: int,
-        period: Period = Period.Annual,
+        self, security_id: int, period: Period = Period.Annual
     ) -> pd.DataFrame:
         """
-        Profit & Loss statement (Revenue, EBITDA, PAT, margins).
+        Profit & Loss statement — Revenue, EBITDA, PAT, margins.
 
         Parameters
         ----------
         security_id : int
         period : Period
-
-        Returns
-        -------
-        pd.DataFrame
 
         Examples
         --------
         >>> se.get_profit_loss(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["profit_loss"].format(
-            sid=security_id, period=period.value
-        )
-        return _to_df(self._get(path))
+        return _df(self._get(
+            _EP["profit_loss"].format(sid=security_id, p=period.value)
+        ))
 
     def get_balance_sheet(
-        self,
-        security_id: int,
-        period: Period = Period.Annual,
+        self, security_id: int, period: Period = Period.Annual
     ) -> pd.DataFrame:
         """
-        Balance sheet (total assets, liabilities, equity, borrowings, …).
+        Balance sheet — assets, liabilities, equity, borrowings.
 
         Parameters
         ----------
         security_id : int
         period : Period
-
-        Returns
-        -------
-        pd.DataFrame
 
         Examples
         --------
         >>> se.get_balance_sheet(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["balance_sheet"].format(
-            sid=security_id, period=period.value
-        )
-        return _to_df(self._get(path))
+        return _df(self._get(
+            _EP["balance_sheet"].format(sid=security_id, p=period.value)
+        ))
 
     def get_cash_flow(
-        self,
-        security_id: int,
-        period: Period = Period.Annual,
+        self, security_id: int, period: Period = Period.Annual
     ) -> pd.DataFrame:
         """
-        Cash flow statement (operating, investing, financing).
+        Cash flow statement — operating, investing, financing.
 
         Parameters
         ----------
         security_id : int
         period : Period
-
-        Returns
-        -------
-        pd.DataFrame
 
         Examples
         --------
         >>> se.get_cash_flow(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["cash_flow"].format(
-            sid=security_id, period=period.value
-        )
-        return _to_df(self._get(path))
+        return _df(self._get(
+            _EP["cash_flow"].format(sid=security_id, p=period.value)
+        ))
 
     def get_key_ratios(
-        self,
-        security_id: int,
-        period: Period = Period.Annual,
+        self, security_id: int, period: Period = Period.Annual
     ) -> pd.DataFrame:
         """
-        Key financial ratios (P/E, ROE, ROCE, D/E, EPS, Book Value, …).
+        Key ratios — P/E, ROE, ROCE, D/E, EPS, Book Value, …
 
         Parameters
         ----------
         security_id : int
         period : Period
 
-        Returns
-        -------
-        pd.DataFrame
-
         Examples
         --------
         >>> se.get_key_ratios(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["key_ratios"].format(
-            sid=security_id, period=period.value
-        )
-        return _to_df(self._get(path))
+        return _df(self._get(
+            _EP["key_ratios"].format(sid=security_id, p=period.value)
+        ))
 
     def get_all_financials(
-        self,
-        security_id: int,
-        period: Period = Period.Annual,
+        self, security_id: int, period: Period = Period.Annual
     ) -> dict[str, pd.DataFrame]:
         """
-        Fetch all five financial statements in one call.
+        All five financial statements in one call.
 
         Returns
         -------
-        dict with keys:
-            ``financial_results``, ``profit_loss``, ``balance_sheet``,
-            ``cash_flow``, ``key_ratios``
+        dict with keys ``financial_results``, ``profit_loss``,
+        ``balance_sheet``, ``cash_flow``, ``key_ratios``.
 
         Examples
         --------
         >>> fin = se.get_all_financials(2969)
-        >>> fin["profit_loss"]
-        >>> fin["balance_sheet"]
+        >>> fin["profit_loss"].head()
         """
         return {
             "financial_results": self.get_financials(security_id, period),
@@ -588,126 +508,99 @@ class StockEdge:
         }
 
     # ------------------------------------------------------------------
-    # Portfolio / holdings data
+    # Portfolio / holdings
     # ------------------------------------------------------------------
 
     def get_shareholding(self, security_id: int) -> pd.DataFrame:
         """
-        Shareholding pattern — promoters, FII, DII, public (quarterly).
+        Shareholding pattern — promoters, FII, DII, retail (quarterly).
 
         Parameters
         ----------
         security_id : int
-
-        Returns
-        -------
-        pd.DataFrame  Rows per category with percentage holdings over time.
 
         Examples
         --------
         >>> se.get_shareholding(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["shareholding"].format(sid=security_id)
-        return _to_df(self._get(path))
+        return _df(self._get(_EP["shareholding"].format(sid=security_id)))
 
     def get_mf_holdings(self, security_id: int) -> pd.DataFrame:
         """
-        Mutual fund holdings — funds that own the stock, quantity, and value.
+        Mutual fund holdings — which funds own the stock, how much.
 
         Parameters
         ----------
         security_id : int
-
-        Returns
-        -------
-        pd.DataFrame
 
         Examples
         --------
         >>> se.get_mf_holdings(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["mf_holdings"].format(sid=security_id)
-        return _to_df(self._get(path))
+        return _df(self._get(_EP["mf_holdings"].format(sid=security_id)))
 
     def get_fii_holdings(self, security_id: int) -> pd.DataFrame:
         """
-        FII (Foreign Institutional Investor) holdings history.
+        FII / FPI holdings history.
 
         Parameters
         ----------
         security_id : int
-
-        Returns
-        -------
-        pd.DataFrame
 
         Examples
         --------
         >>> se.get_fii_holdings(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["fii_holdings"].format(sid=security_id)
-        return _to_df(self._get(path))
+        return _df(self._get(_EP["fii_holdings"].format(sid=security_id)))
 
     def get_bulk_deals(self, security_id: int) -> pd.DataFrame:
         """
-        Bulk and block deal history (buyer, seller, quantity, price).
+        Bulk and block deal disclosures.
 
         Parameters
         ----------
         security_id : int
-
-        Returns
-        -------
-        pd.DataFrame
 
         Examples
         --------
         >>> se.get_bulk_deals(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["bulk_deals"].format(sid=security_id)
-        return _to_df(self._get(path))
+        return _df(self._get(_EP["bulk_deals"].format(sid=security_id)))
 
     def get_insider_trading(self, security_id: int) -> pd.DataFrame:
         """
-        Insider / promoter trading disclosures.
+        Promoter / insider buy-sell disclosures.
 
         Parameters
         ----------
         security_id : int
-
-        Returns
-        -------
-        pd.DataFrame
 
         Examples
         --------
         >>> se.get_insider_trading(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["insider_trading"].format(sid=security_id)
-        return _to_df(self._get(path))
+        return _df(self._get(_EP["insider_trading"].format(sid=security_id)))
 
     def get_all_portfolio_data(
         self, security_id: int
     ) -> dict[str, pd.DataFrame]:
         """
-        Fetch all portfolio / ownership data in one call.
+        All ownership / portfolio data in one call.
 
         Returns
         -------
-        dict with keys:
-            ``shareholding``, ``mf_holdings``, ``fii_holdings``,
-            ``bulk_deals``, ``insider_trading``
+        dict with keys ``shareholding``, ``mf_holdings``, ``fii_holdings``,
+        ``bulk_deals``, ``insider_trading``.
 
         Examples
         --------
         >>> port = se.get_all_portfolio_data(2969)
         >>> port["shareholding"]
-        >>> port["mf_holdings"]
         """
         return {
             "shareholding":    self.get_shareholding(security_id),
@@ -718,7 +611,7 @@ class StockEdge:
         }
 
     # ------------------------------------------------------------------
-    # Misc / other data
+    # Misc
     # ------------------------------------------------------------------
 
     def get_peer_comparison(self, security_id: int) -> pd.DataFrame:
@@ -729,69 +622,53 @@ class StockEdge:
         ----------
         security_id : int
 
-        Returns
-        -------
-        pd.DataFrame
-
         Examples
         --------
         >>> se.get_peer_comparison(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["peer_comparison"].format(sid=security_id)
-        return _to_df(self._get(path))
+        return _df(self._get(_EP["peer_comparison"].format(sid=security_id)))
 
     def get_price_history(self, security_id: int) -> pd.DataFrame:
         """
-        Historical OHLCV price data.
+        Historical OHLCV prices.
 
         Parameters
         ----------
         security_id : int
-
-        Returns
-        -------
-        pd.DataFrame  Columns: Date, Open, High, Low, Close, Volume, …
 
         Examples
         --------
         >>> se.get_price_history(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["price_history"].format(sid=security_id)
-        return _to_df(self._get(path))
+        return _df(self._get(_EP["price_history"].format(sid=security_id)))
 
     def get_edge_report(self, security_id: int) -> pd.DataFrame:
         """
-        StockEdge Edge Report — curated analysis summary for the company.
+        StockEdge curated Edge Report.
 
         Parameters
         ----------
         security_id : int
-
-        Returns
-        -------
-        pd.DataFrame
 
         Examples
         --------
         >>> se.get_edge_report(2969)
         """
         self._require_auth()
-        path = _ENDPOINTS["edge_report"].format(sid=security_id)
-        return _to_df(self._get(path))
+        return _df(self._get(_EP["edge_report"].format(sid=security_id)))
 
     # ------------------------------------------------------------------
-    # Dunder
+    # Properties / dunder
     # ------------------------------------------------------------------
 
     @property
     def is_logged_in(self) -> bool:
-        """True if an auth token is present in the session."""
-        return self._token is not None
+        return bool(self._token)
 
     def __repr__(self) -> str:
-        state = f"user_id={self._user_id}" if self._token else "not authenticated"
+        state = f"user_id={self._user_id}" if self._token else "not logged in"
         return f"StockEdge({state})"
 
 
@@ -799,17 +676,24 @@ class StockEdge:
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
-def _to_df(data) -> pd.DataFrame:
-    """Convert a JSON API response (list | dict | None) to a DataFrame."""
+def _df(data: Any) -> pd.DataFrame:
+    """Coerce a JSON response (list | dict | None) into a DataFrame."""
     if data is None:
         return pd.DataFrame()
     if isinstance(data, list):
         return pd.DataFrame(data)
     if isinstance(data, dict):
-        # Many StockEdge endpoints wrap records under a specific key
         for key in ("Data", "data", "Result", "result", "Items", "items", "Records"):
             if key in data and isinstance(data[key], list):
                 return pd.DataFrame(data[key])
-        # Flat dict — single record
         return pd.DataFrame([data])
     return pd.DataFrame()
+
+
+def _deep(d: dict, *keys: str) -> Any:
+    """Safely traverse nested dicts: _deep(d, 'Data', 'Token')."""
+    for k in keys:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(k)
+    return d
